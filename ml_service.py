@@ -6,6 +6,9 @@ import joblib
 app = FastAPI()
  
 # ================= CONFIG =================
+# ✅ YES, you MUST give ServiceNow instance details
+# (but see Section 2 below for BEST PRACTICE)
+ 
 SERVICENOW_INSTANCE = "https://YOUR_INSTANCE.service-now.com"
 SN_USER = "YOUR_API_USER"
 SN_PASS = "YOUR_API_PASSWORD"
@@ -15,7 +18,8 @@ PREDICTIONS_TABLE = "u_lcr_predictions"
 MODEL_NAME = "LCR_ML_v1"
  
 # ============== LOAD MODEL ===============
-model = joblib.load("model.pkl")
+# ✅ File name MUST match GitHub file exactly
+model = joblib.load("reclaim_model.pkl")
  
 # ========== BUSINESS LOGIC ==============
 def decide_action_and_reason(row):
@@ -38,20 +42,27 @@ def decide_action_and_reason(row):
 @app.post("/run_predictions")
 def run_predictions():
  
-    # 1. Fetch Feature Store
+    # 1️⃣ Fetch Feature Store from ServiceNow
     response = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
         auth=(SN_USER, SN_PASS),
         headers={"Accept": "application/json"}
     )
  
-    data = response.json()["result"]
+    if response.status_code != 200:
+        return {
+            "status": "error",
+            "message": "Failed to fetch feature store",
+            "code": response.status_code
+        }
+ 
+    data = response.json().get("result", [])
     df = pd.DataFrame(data)
  
     if df.empty:
         return {"status": "no data"}
  
-    # 2. Feature columns
+    # 2️⃣ Feature columns
     feature_cols = [
         "u_days_since_last_use",
         "u_active_days_last_30_days",
@@ -63,17 +74,19 @@ def run_predictions():
  
     X = df[feature_cols].astype(float)
  
-    # 3. ML inference
+    # 3️⃣ ML inference
     df["reclaim_probability"] = model.predict_proba(X)[:, 1]
  
-    # 4. Decide action
+    # 4️⃣ Decide action + reason
     df[["action", "reason"]] = df.apply(
         lambda r: decide_action_and_reason(r),
         axis=1,
         result_type="expand"
     )
  
-    # 5. Insert predictions
+    # 5️⃣ Insert predictions into ServiceNow
+    inserted = 0
+ 
     for _, row in df.iterrows():
         payload = {
             "u_user": row["u_user"],
@@ -85,11 +98,18 @@ def run_predictions():
             "u_notification_stage": "NONE"
         }
  
-        requests.post(
+        r = requests.post(
             f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
             auth=(SN_USER, SN_PASS),
             json=payload
         )
  
-    return {"status": "success"}
+        if r.status_code == 201:
+            inserted += 1
+ 
+    return {
+        "status": "success",
+        "records_processed": len(df),
+        "records_inserted": inserted
+    }
  
