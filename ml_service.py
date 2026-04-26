@@ -123,4 +123,4 @@ def run_predictions():
         "records_processed": len(df),
         "records_inserted": inserted
     }
-``
+
