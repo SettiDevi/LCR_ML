@@ -22,13 +22,27 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ LIMIT BATCH SIZE (IMPORTANT)
-BATCH_SIZE = 200
+# ✅ YOU REQUESTED THIS
+BATCH_SIZE = 2000
 
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
 
-# ================= BUSINESS LOGIC =================
+# ================= HELPERS =================
+def get_user_sys_id(username):
+    """Resolve username → sys_user.sys_id"""
+    r = requests.get(
+        f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
+        auth=(SN_USER, SN_PASS),
+        headers=HEADERS,
+        params={
+            "sysparm_query": f"user_name={username}",
+            "sysparm_limit": "1"
+        }
+    )
+    res = r.json().get("result", [])
+    return res[0]["sys_id"] if res else None
+
 def decide_action_and_reason(row):
     days = int(row.get("u_days_since_last_use", 0))
     premium_used = int(row.get("u_premium_feature_usage_last_30_days", 0))
@@ -45,6 +59,7 @@ def decide_action_and_reason(row):
 
     return "KEEP", "License actively used"
 
+# ================= API =================
 @app.get("/")
 def health_check():
     return {"status": "LCR ML service running"}
@@ -52,23 +67,23 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store (LIMITED)
-        response = requests.get(
+        # 1️⃣ Fetch feature store
+        fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
             headers=HEADERS,
             params={"sysparm_limit": BATCH_SIZE},
-            timeout=60
+            timeout=90
         )
 
-        if response.status_code != 200:
-            return {"status": "error", "details": response.text}
+        if fs.status_code != 200:
+            return {"status": "error", "details": fs.text}
 
-        df = pd.DataFrame(response.json().get("result", []))
+        df = pd.DataFrame(fs.json().get("result", []))
         if df.empty:
             return {"status": "no data"}
 
-        # 2️⃣ Feature processing
+        # 2️⃣ Feature preparation
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -83,7 +98,12 @@ def run_predictions():
                 df[col] = 0
 
         for col in ["u_seasonal_user", "u_user_active"]:
-            df[col] = df[col].astype(str).str.lower().map({"true": 1, "false": 0}).fillna(0)
+            df[col] = (
+                df[col].astype(str)
+                .str.lower()
+                .map({"true": 1, "false": 0})
+                .fillna(0)
+            )
 
         X = df[feature_cols].fillna(0).astype(float)
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
@@ -102,8 +122,12 @@ def run_predictions():
             if not row.get("u_user") or not row.get("u_license_sku"):
                 continue
 
+            user_sys_id = get_user_sys_id(row["u_user"])
+            if not user_sys_id:
+                continue
+
             payload = {
-                "u_user": row["u_user"],
+                "u_user": user_sys_id,
                 "u_license_sku": row["u_license_sku"],
                 "u_predicted_action": row["u_predicted_action"],
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
@@ -113,13 +137,13 @@ def run_predictions():
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
-            # 🔍 Check if prediction already exists
+            # Check existing record
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
                 params={
-                    "sysparm_query": f"u_user={row['u_user']}^u_license_sku={row['u_license_sku']}",
+                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={row['u_license_sku']}",
                     "sysparm_limit": "1"
                 }
             )
@@ -127,7 +151,7 @@ def run_predictions():
             existing = check.json().get("result", [])
 
             if existing:
-                # ✅ UPDATE
+                # UPDATE
                 sys_id = existing[0]["sys_id"]
                 requests.put(
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
@@ -136,7 +160,7 @@ def run_predictions():
                     json=payload
                 )
             else:
-                # ✅ INSERT
+                # INSERT
                 requests.post(
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                     auth=(SN_USER, SN_PASS),
