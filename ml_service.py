@@ -25,12 +25,14 @@ HEADERS = {
 # ✅ YOU REQUESTED THIS
 BATCH_SIZE = 2000
 
+# ✅ ADD OFFSET (DEFAULT = 0)
+OFFSET = int(os.getenv("OFFSET", 0))
+
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
 
 # ================= HELPERS =================
 def get_user_sys_id(username):
-    """Resolve username → sys_user.sys_id"""
     r = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
         auth=(SN_USER, SN_PASS),
@@ -67,12 +69,15 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store
+        # 1️⃣ Fetch feature store WITH PAGINATION ✅
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
             headers=HEADERS,
-            params={"sysparm_limit": BATCH_SIZE},
+            params={
+                "sysparm_limit": BATCH_SIZE,
+                "sysparm_offset": OFFSET
+            },
             timeout=90
         )
 
@@ -137,7 +142,6 @@ def run_predictions():
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
-            # Check existing record
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
@@ -151,7 +155,6 @@ def run_predictions():
             existing = check.json().get("result", [])
 
             if existing:
-                # UPDATE
                 sys_id = existing[0]["sys_id"]
                 requests.put(
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
@@ -160,7 +163,6 @@ def run_predictions():
                     json=payload
                 )
             else:
-                # INSERT
                 requests.post(
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                     auth=(SN_USER, SN_PASS),
@@ -172,9 +174,11 @@ def run_predictions():
 
         return {
             "status": "success",
-            "records_processed": processed
+            "records_processed": processed,
+            "offset_used": OFFSET
         }
 
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "details": str(e)}
+``
