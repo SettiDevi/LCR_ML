@@ -7,7 +7,7 @@ import traceback
 
 app = FastAPI()
 
-# ================= CONFIG (ENV VARIABLES) =================
+# ================= CONFIG =================
 SERVICENOW_INSTANCE = os.getenv("SN_INSTANCE")
 SN_USER = os.getenv("SN_USER")
 SN_PASS = os.getenv("SN_PASS")
@@ -79,7 +79,7 @@ def run_predictions():
         if df.empty:
             return {"status": "no data"}
 
-        # 2️⃣ Select ML features
+        # 2️⃣ Feature columns
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -111,12 +111,17 @@ def run_predictions():
 
         # 5️⃣ Insert predictions into ServiceNow
         for _, row in df.iterrows():
+
+            # Skip invalid rows
+            if not row.get("u_user") or not row.get("u_license_sku"):
+                continue
+
             payload = {
-                "u_user": row.get("u_user"),
-                "u_license_sku": row.get("u_license_sku"),
-                "u_predicted_action": row.get("u_predicted_action"),
+                "u_user": row["u_user"],
+                "u_license_sku": row["u_license_sku"],
+                "u_predicted_action": row["u_predicted_action"],
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
-                "u_ai_reclaim_reason": row.get("u_ai_reclaim_reason"),
+                "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
                 "u_notification_stage": "NONE"
             }
