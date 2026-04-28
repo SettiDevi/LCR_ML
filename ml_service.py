@@ -22,10 +22,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ YOU REQUESTED THIS
+# ✅ Batch + pagination
 BATCH_SIZE = 2000
-
-# ✅ ADD OFFSET (DEFAULT = 0)
 OFFSET = int(os.getenv("OFFSET", 0))
 
 # ================= LOAD MODEL =================
@@ -33,6 +31,7 @@ model = joblib.load("reclaim_model.pkl")
 
 # ================= HELPERS =================
 def get_user_sys_id(username):
+    """Resolve username → sys_user.sys_id"""
     r = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
         auth=(SN_USER, SN_PASS),
@@ -69,7 +68,7 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store WITH PAGINATION ✅
+        # 1️⃣ Fetch feature store WITH pagination
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
@@ -102,6 +101,7 @@ def run_predictions():
             if col not in df.columns:
                 df[col] = 0
 
+        # Convert boolean strings → numbers
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
                 df[col].astype(str)
@@ -181,4 +181,3 @@ def run_predictions():
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "details": str(e)}
-``
