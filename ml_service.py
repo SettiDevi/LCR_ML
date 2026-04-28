@@ -63,15 +63,13 @@ def run_predictions():
         print("Feature store HTTP status:", response.status_code)
 
         if response.status_code != 200:
-            print("Feature store fetch failed:", response.text)
             return {
                 "status": "error",
                 "message": "Failed to fetch feature store",
                 "details": response.text
             }
 
-        data = response.json().get("result", [])
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(response.json().get("result", []))
 
         print("Rows fetched:", len(df))
         print("Columns received:", df.columns.tolist())
@@ -89,12 +87,23 @@ def run_predictions():
             "u_user_active"
         ]
 
-        # Ensure all required columns exist
+        # Ensure all columns exist
         for col in feature_cols:
             if col not in df.columns:
                 df[col] = 0
 
-        # Safe numeric conversion
+        # ✅ FIX 1: Convert boolean strings ("true"/"false") to numbers
+        bool_cols = ["u_seasonal_user", "u_user_active"]
+        for col in bool_cols:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.lower()
+                .map({"true": 1, "false": 0})
+                .fillna(0)
+            )
+
+        # ✅ FIX 2: Safe numeric conversion
         X = df[feature_cols].fillna(0).astype(float)
 
         # 3️⃣ ML prediction
@@ -146,9 +155,7 @@ def run_predictions():
         }
 
     except Exception as e:
-        print("EXCEPTION OCCURRED")
         traceback.print_exc()
-
         return {
             "status": "error",
             "message": "Internal server error in ML service",
