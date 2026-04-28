@@ -4,6 +4,7 @@ import requests
 import joblib
 import os
 import traceback
+from datetime import datetime
 
 app = FastAPI()
 
@@ -20,6 +21,9 @@ HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
+
+# ✅ LIMIT BATCH SIZE (IMPORTANT)
+BATCH_SIZE = 200
 
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
@@ -41,7 +45,6 @@ def decide_action_and_reason(row):
 
     return "KEEP", "License actively used"
 
-# ================= API =================
 @app.get("/")
 def health_check():
     return {"status": "LCR ML service running"}
@@ -49,35 +52,23 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        print("RUN_PREDICTIONS CALLED")
-
-        # 1️⃣ Fetch feature store
+        # 1️⃣ Fetch feature store (LIMITED)
         response = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
             headers=HEADERS,
-            params={"sysparm_limit": "10000"},
+            params={"sysparm_limit": BATCH_SIZE},
             timeout=60
         )
 
-        print("Feature store HTTP status:", response.status_code)
-
         if response.status_code != 200:
-            return {
-                "status": "error",
-                "message": "Failed to fetch feature store",
-                "details": response.text
-            }
+            return {"status": "error", "details": response.text}
 
         df = pd.DataFrame(response.json().get("result", []))
-
-        print("Rows fetched:", len(df))
-        print("Columns received:", df.columns.tolist())
-
         if df.empty:
             return {"status": "no data"}
 
-        # 2️⃣ Feature columns
+        # 2️⃣ Feature processing
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -87,41 +78,27 @@ def run_predictions():
             "u_user_active"
         ]
 
-        # Ensure all columns exist
         for col in feature_cols:
             if col not in df.columns:
                 df[col] = 0
 
-        # ✅ FIX 1: Convert boolean strings ("true"/"false") to numbers
-        bool_cols = ["u_seasonal_user", "u_user_active"]
-        for col in bool_cols:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.lower()
-                .map({"true": 1, "false": 0})
-                .fillna(0)
-            )
+        for col in ["u_seasonal_user", "u_user_active"]:
+            df[col] = df[col].astype(str).str.lower().map({"true": 1, "false": 0}).fillna(0)
 
-        # ✅ FIX 2: Safe numeric conversion
         X = df[feature_cols].fillna(0).astype(float)
-
-        # 3️⃣ ML prediction
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
-        # 4️⃣ Decide action & reason
         df[["u_predicted_action", "u_ai_reclaim_reason"]] = df.apply(
             lambda r: decide_action_and_reason(r),
             axis=1,
             result_type="expand"
         )
 
-        inserted = 0
+        processed = 0
 
-        # 5️⃣ Insert predictions into ServiceNow
+        # 3️⃣ UPSERT predictions
         for _, row in df.iterrows():
 
-            # Skip invalid rows
             if not row.get("u_user") or not row.get("u_license_sku"):
                 continue
 
@@ -132,32 +109,48 @@ def run_predictions():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                "u_notification_stage": "NONE"
+                "u_notification_stage": "NONE",
+                "u_predicted_on": datetime.utcnow().isoformat()
             }
 
-            r = requests.post(
+            # 🔍 Check if prediction already exists
+            check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
-                json=payload,
-                timeout=30
+                params={
+                    "sysparm_query": f"u_user={row['u_user']}^u_license_sku={row['u_license_sku']}",
+                    "sysparm_limit": "1"
+                }
             )
 
-            if r.status_code == 201:
-                inserted += 1
+            existing = check.json().get("result", [])
+
+            if existing:
+                # ✅ UPDATE
+                sys_id = existing[0]["sys_id"]
+                requests.put(
+                    f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
+                    auth=(SN_USER, SN_PASS),
+                    headers=HEADERS,
+                    json=payload
+                )
             else:
-                print("Insert failed:", r.status_code, r.text)
+                # ✅ INSERT
+                requests.post(
+                    f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
+                    auth=(SN_USER, SN_PASS),
+                    headers=HEADERS,
+                    json=payload
+                )
+
+            processed += 1
 
         return {
             "status": "success",
-            "records_processed": len(df),
-            "records_inserted": inserted
+            "records_processed": processed
         }
 
     except Exception as e:
         traceback.print_exc()
-        return {
-            "status": "error",
-            "message": "Internal server error in ML service",
-            "details": str(e)
-        }
+        return {"status": "error", "details": str(e)}
