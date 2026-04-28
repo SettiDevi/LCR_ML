@@ -23,7 +23,7 @@ HEADERS = {
 }
 
 # ✅ Batch + pagination
-BATCH_SIZE = 2000
+BATCH_SIZE = 1000
 OFFSET = int(os.getenv("OFFSET", 0))
 
 # ================= LOAD MODEL =================
