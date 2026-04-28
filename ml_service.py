@@ -22,8 +22,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ Batch + pagination
-BATCH_SIZE = 5000
+# ✅ CORRECT & SAFE BATCH SIZE
+BATCH_SIZE = 500
 OFFSET = int(os.getenv("OFFSET", 0))
 
 # ================= LOAD MODEL =================
@@ -31,7 +31,6 @@ model = joblib.load("reclaim_model.pkl")
 
 # ================= HELPERS =================
 def get_user_sys_id(username):
-    """Resolve username → sys_user.sys_id"""
     r = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
         auth=(SN_USER, SN_PASS),
@@ -68,7 +67,6 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store WITH pagination
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
@@ -87,7 +85,6 @@ def run_predictions():
         if df.empty:
             return {"status": "no data"}
 
-        # 2️⃣ Feature preparation
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -101,14 +98,8 @@ def run_predictions():
             if col not in df.columns:
                 df[col] = 0
 
-        # Convert boolean strings → numbers
         for col in ["u_seasonal_user", "u_user_active"]:
-            df[col] = (
-                df[col].astype(str)
-                .str.lower()
-                .map({"true": 1, "false": 0})
-                .fillna(0)
-            )
+            df[col] = df[col].astype(str).str.lower().map({"true": 1, "false": 0}).fillna(0)
 
         X = df[feature_cols].fillna(0).astype(float)
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
@@ -121,9 +112,7 @@ def run_predictions():
 
         processed = 0
 
-        # 3️⃣ UPSERT predictions
         for _, row in df.iterrows():
-
             if not row.get("u_user") or not row.get("u_license_sku"):
                 continue
 
