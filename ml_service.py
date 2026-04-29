@@ -22,9 +22,9 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ SAFE & PROVEN VALUES (FROM ENV)
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))   # 200 works (~197 records)
-OFFSET = int(os.getenv("OFFSET", 0))              # MUST be 0 for first run
+# ✅ SAFE VALUES
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))
+OFFSET = int(os.getenv("OFFSET", 0))
 
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
@@ -70,14 +70,15 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store (paginated)
+        # ✅ FIX 1: FILTER BAD ROWS AT SOURCE (THIS IS THE KEY FIX)
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
             headers=HEADERS,
             params={
                 "sysparm_limit": BATCH_SIZE,
-                "sysparm_offset": OFFSET
+                "sysparm_offset": OFFSET,
+                "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
             },
             timeout=90
         )
@@ -132,12 +133,9 @@ def run_predictions():
         # 4️⃣ UPSERT predictions
         for _, row in df.iterrows():
 
-            if not row.get("u_user") or not row.get("u_license_sku"):
-                continue
-
             user_sys_id = get_user_sys_id(row["u_user"])
             if not user_sys_id:
-                continue
+                continue  # extremely rare now
 
             payload = {
                 "u_user": user_sys_id,
@@ -146,7 +144,7 @@ def run_predictions():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                "u_notification_stage": "NONE",  # Flow updates this
+                "u_notification_stage": "NONE",
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
