@@ -22,8 +22,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ SAFE & PROVEN VALUES
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))   # 200 works (≈197 records)
+# ✅ SAFE & PROVEN VALUES (FROM ENV)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))   # 200 works (~197 records)
 OFFSET = int(os.getenv("OFFSET", 0))              # MUST be 0 for first run
 
 # ================= LOAD MODEL =================
@@ -109,7 +109,8 @@ def run_predictions():
 
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
-                df[col].astype(str)
+                df[col]
+                .astype(str)
                 .str.lower()
                 .map({"true": 1, "false": 0})
                 .fillna(0)
