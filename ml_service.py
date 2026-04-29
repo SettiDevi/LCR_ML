@@ -22,7 +22,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ CORRECT & SAFE BATCH SIZE
+# ✅ SAFE BATCH + PAGINATION
 BATCH_SIZE = 500
 OFFSET = int(os.getenv("OFFSET", 0))
 
@@ -31,6 +31,7 @@ model = joblib.load("reclaim_model.pkl")
 
 # ================= HELPERS =================
 def get_user_sys_id(username):
+    """Resolve ServiceNow username → sys_user.sys_id"""
     r = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
         auth=(SN_USER, SN_PASS),
@@ -42,6 +43,7 @@ def get_user_sys_id(username):
     )
     res = r.json().get("result", [])
     return res[0]["sys_id"] if res else None
+
 
 def decide_action_and_reason(row):
     days = int(row.get("u_days_since_last_use", 0))
@@ -59,14 +61,17 @@ def decide_action_and_reason(row):
 
     return "KEEP", "License actively used"
 
+
 # ================= API =================
 @app.get("/")
 def health_check():
     return {"status": "LCR ML service running"}
 
+
 @app.post("/run_predictions")
 def run_predictions():
     try:
+        # 1️⃣ Fetch feature store with pagination
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
@@ -85,6 +90,7 @@ def run_predictions():
         if df.empty:
             return {"status": "no data"}
 
+        # 2️⃣ Feature preparation
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -98,10 +104,19 @@ def run_predictions():
             if col not in df.columns:
                 df[col] = 0
 
+        # Convert boolean strings safely
         for col in ["u_seasonal_user", "u_user_active"]:
-            df[col] = df[col].astype(str).str.lower().map({"true": 1, "false": 0}).fillna(0)
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.lower()
+                .map({"true": 1, "false": 0})
+                .fillna(0)
+            )
 
         X = df[feature_cols].fillna(0).astype(float)
+
+        # 3️⃣ ML prediction
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
         df[["u_predicted_action", "u_ai_reclaim_reason"]] = df.apply(
@@ -112,7 +127,9 @@ def run_predictions():
 
         processed = 0
 
+        # 4️⃣ UPSERT predictions
         for _, row in df.iterrows():
+
             if not row.get("u_user") or not row.get("u_license_sku"):
                 continue
 
@@ -127,10 +144,12 @@ def run_predictions():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
+                # Flow will update this later
                 "u_notification_stage": "NONE",
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
+            # Check if record exists
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
