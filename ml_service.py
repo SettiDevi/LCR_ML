@@ -22,16 +22,15 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ SAFE BATCH + PAGINATION
-BATCH_SIZE = 500
-OFFSET = int(os.getenv("OFFSET", 0))
+# ✅ SAFE & PROVEN VALUES
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))   # 200 works (≈197 records)
+OFFSET = int(os.getenv("OFFSET", 0))              # MUST be 0 for first run
 
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
 
 # ================= HELPERS =================
 def get_user_sys_id(username):
-    """Resolve ServiceNow username → sys_user.sys_id"""
     r = requests.get(
         f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
         auth=(SN_USER, SN_PASS),
@@ -71,7 +70,7 @@ def health_check():
 @app.post("/run_predictions")
 def run_predictions():
     try:
-        # 1️⃣ Fetch feature store with pagination
+        # 1️⃣ Fetch feature store (paginated)
         fs = requests.get(
             f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
             auth=(SN_USER, SN_PASS),
@@ -88,7 +87,11 @@ def run_predictions():
 
         df = pd.DataFrame(fs.json().get("result", []))
         if df.empty:
-            return {"status": "no data"}
+            return {
+                "status": "no data",
+                "batch_size": BATCH_SIZE,
+                "offset_used": OFFSET
+            }
 
         # 2️⃣ Feature preparation
         feature_cols = [
@@ -104,11 +107,9 @@ def run_predictions():
             if col not in df.columns:
                 df[col] = 0
 
-        # Convert boolean strings safely
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
-                df[col]
-                .astype(str)
+                df[col].astype(str)
                 .str.lower()
                 .map({"true": 1, "false": 0})
                 .fillna(0)
@@ -144,12 +145,10 @@ def run_predictions():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                # Flow will update this later
-                "u_notification_stage": "NONE",
+                "u_notification_stage": "NONE",  # Flow updates this
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
-            # Check if record exists
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
@@ -183,6 +182,7 @@ def run_predictions():
         return {
             "status": "success",
             "records_processed": processed,
+            "batch_size": BATCH_SIZE,
             "offset_used": OFFSET
         }
 
