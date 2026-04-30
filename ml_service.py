@@ -47,7 +47,7 @@ def run_predictions_job():
         # ---------- 1. FETCH ALL FEATURE STORE RECORDS ----------
         all_rows = []
         offset = 0
-        limit = 1000  # per API call ONLY
+        limit = 1000
 
         while True:
             resp = requests.get(
@@ -127,8 +127,8 @@ def run_predictions_job():
         processed = 0
 
         for _, row in df.iterrows():
-            user_sys_id = row["u_user"]              # already sys_id ✅
-            license_sys_id = row["u_license_sku"]    # already sys_id ✅
+            user_sys_id = row["u_user"]
+            license_sys_id = row["u_license_sku"]
 
             payload = {
                 "u_user": user_sys_id,
@@ -140,7 +140,6 @@ def run_predictions_job():
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
-            # Check if prediction already exists
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
@@ -171,7 +170,7 @@ def run_predictions_job():
 
             processed += 1
 
-        print(f"✅ Prediction job completed successfully")
+        print("✅ Prediction job completed successfully")
         print(f"✅ Total records processed: {processed}")
 
     except Exception:
