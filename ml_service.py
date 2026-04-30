@@ -22,7 +22,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ IMPORTANT: Tell ServiceNow inputs are SYS_IDs
+# ✅ Tell ServiceNow that we are sending SYS_IDs on write
 WRITE_PARAMS = {
     "sysparm_input_display_value": "false"
 }
@@ -63,7 +63,7 @@ def run_predictions_job():
                     "sysparm_limit": limit,
                     "sysparm_offset": offset,
                     "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY",
-                    "sysparm_display_value": "false"  # ✅ RAW SYS_IDS
+                    "sysparm_display_value": "false"   # ✅ RAW SYS_ID VALUES
                 },
                 timeout=90
             )
@@ -133,8 +133,8 @@ def run_predictions_job():
         processed = 0
 
         for _, row in df.iterrows():
-            user_sys_id = row["u_user"]           # ✅ sys_id
-            license_sys_id = row["u_license_sku"] # ✅ sys_id
+            user_sys_id = row["u_user"]
+            license_sys_id = row["u_license_sku"]
 
             payload = {
                 "u_user": user_sys_id,
@@ -165,7 +165,7 @@ def run_predictions_job():
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
                     auth=(SN_USER, SN_PASS),
                     headers=HEADERS,
-                    params=WRITE_PARAMS,   # ✅ CRITICAL FIX
+                    params=WRITE_PARAMS,
                     json=payload
                 )
             else:
@@ -173,7 +173,7 @@ def run_predictions_job():
                     f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                     auth=(SN_USER, SN_PASS),
                     headers=HEADERS,
-                    params=WRITE_PARAMS,   # ✅ CRITICAL FIX
+                    params=WRITE_PARAMS,
                     json=payload
                 )
 
@@ -185,4 +185,3 @@ def run_predictions_job():
     except Exception:
         print("❌ Error during prediction job")
         traceback.print_exc()
-
