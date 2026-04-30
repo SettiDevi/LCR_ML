@@ -9,7 +9,7 @@ from datetime import datetime
 app = FastAPI()
 
 # ================= CONFIG =================
-SERVICENOW_INSTANCE = os.getenv("SN_INSTANCE")   # e.g. https://dev12345.service-now.com
+SERVICENOW_INSTANCE = os.getenv("SN_INSTANCE")
 SN_USER = os.getenv("SN_USER")
 SN_PASS = os.getenv("SN_PASS")
 
@@ -57,7 +57,8 @@ def run_predictions_job():
                 params={
                     "sysparm_limit": limit,
                     "sysparm_offset": offset,
-                    "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
+                    "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY",
+                    "sysparm_display_value": "false"  # ✅ CRITICAL FIX
                 },
                 timeout=90
             )
@@ -127,8 +128,8 @@ def run_predictions_job():
         processed = 0
 
         for _, row in df.iterrows():
-            user_sys_id = row["u_user"]
-            license_sys_id = row["u_license_sku"]
+            user_sys_id = row["u_user"]           # ✅ real sys_id
+            license_sys_id = row["u_license_sku"] # ✅ real sys_id
 
             payload = {
                 "u_user": user_sys_id,
