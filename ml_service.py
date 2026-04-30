@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 import pandas as pd
 import requests
 import joblib
@@ -9,7 +9,7 @@ from datetime import datetime
 app = FastAPI()
 
 # ================= CONFIG =================
-SERVICENOW_INSTANCE = os.getenv("SN_INSTANCE")
+SERVICENOW_INSTANCE = os.getenv("SN_INSTANCE")   # e.g. https://dev12345.service-now.com
 SN_USER = os.getenv("SN_USER")
 SN_PASS = os.getenv("SN_PASS")
 
@@ -22,79 +22,62 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ SAFE VALUES
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))
-OFFSET = int(os.getenv("OFFSET", 0))
-
 # ================= LOAD MODEL =================
 model = joblib.load("reclaim_model.pkl")
 
-# ================= HELPERS =================
-def get_user_sys_id(username):
-    r = requests.get(
-        f"{SERVICENOW_INSTANCE}/api/now/table/sys_user",
-        auth=(SN_USER, SN_PASS),
-        headers=HEADERS,
-        params={
-            "sysparm_query": f"user_name={username}",
-            "sysparm_limit": "1"
-        }
-    )
-    res = r.json().get("result", [])
-    return res[0]["sys_id"] if res else None
-
-
-def decide_action_and_reason(row):
-    days = int(row.get("u_days_since_last_use", 0))
-    premium_used = int(row.get("u_premium_feature_usage_last_30_days", 0))
-    reclaim_prob = float(row.get("reclaim_probability", 0))
-
-    if reclaim_prob >= 0.8:
-        return "RECLAIM", "High reclaim risk predicted by ML"
-
-    if days >= 60 and premium_used == 0:
-        return "DOWNGRADE", "Premium features not used for 60+ days"
-
-    if days >= 45:
-        return "WARNING", "Inactive for 45+ days"
-
-    return "KEEP", "License actively used"
-
-
-# ================= API =================
+# ================= HEALTH CHECK =================
 @app.get("/")
-def health_check():
+def health():
     return {"status": "LCR ML service running"}
 
+# ================= TRIGGER ENDPOINT =================
+@app.post("/start_predictions")
+def start_predictions(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_predictions_job)
+    return {
+        "status": "accepted",
+        "message": "Prediction job started in background"
+    }
 
-@app.post("/run_predictions")
-def run_predictions():
+# ================= BACKGROUND JOB =================
+def run_predictions_job():
     try:
-        # ✅ FIX 1: FILTER BAD ROWS AT SOURCE (THIS IS THE KEY FIX)
-        fs = requests.get(
-            f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
-            auth=(SN_USER, SN_PASS),
-            headers=HEADERS,
-            params={
-                "sysparm_limit": BATCH_SIZE,
-                "sysparm_offset": OFFSET,
-                "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
-            },
-            timeout=90
-        )
+        print("🔹 LCR Prediction job started")
 
-        if fs.status_code != 200:
-            return {"status": "error", "details": fs.text}
+        # ---------- 1. FETCH ALL FEATURE STORE RECORDS ----------
+        all_rows = []
+        offset = 0
+        limit = 1000  # per API call ONLY
 
-        df = pd.DataFrame(fs.json().get("result", []))
-        if df.empty:
-            return {
-                "status": "no data",
-                "batch_size": BATCH_SIZE,
-                "offset_used": OFFSET
-            }
+        while True:
+            resp = requests.get(
+                f"{SERVICENOW_INSTANCE}/api/now/table/{FEATURE_STORE_TABLE}",
+                auth=(SN_USER, SN_PASS),
+                headers=HEADERS,
+                params={
+                    "sysparm_limit": limit,
+                    "sysparm_offset": offset,
+                    "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
+                },
+                timeout=90
+            )
 
-        # 2️⃣ Feature preparation
+            data = resp.json().get("result", [])
+            if not data:
+                break
+
+            all_rows.extend(data)
+            offset += limit
+
+        if not all_rows:
+            print("⚠ No records found in feature store")
+            return
+
+        print(f"✅ Total feature rows fetched: {len(all_rows)}")
+
+        df = pd.DataFrame(all_rows)
+
+        # ---------- 2. FEATURE PREPARATION ----------
         feature_cols = [
             "u_days_since_last_use",
             "u_active_days_last_30_days",
@@ -119,42 +102,52 @@ def run_predictions():
 
         X = df[feature_cols].fillna(0).astype(float)
 
-        # 3️⃣ ML prediction
+        # ---------- 3. ML PREDICTION ----------
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
+        # ---------- 4. BUSINESS DECISION LOGIC ----------
+        def decide(row):
+            days = int(row.get("u_days_since_last_use", 0))
+            premium = int(row.get("u_premium_feature_usage_last_30_days", 0))
+            prob = float(row["reclaim_probability"])
+
+            if prob >= 0.8:
+                return "RECLAIM", "High reclaim risk predicted by ML"
+            if days >= 60 and premium == 0:
+                return "DOWNGRADE", "Premium features not used for 60+ days"
+            if days >= 45:
+                return "WARNING", "Inactive for 45+ days"
+            return "KEEP", "License actively used"
+
         df[["u_predicted_action", "u_ai_reclaim_reason"]] = df.apply(
-            lambda r: decide_action_and_reason(r),
-            axis=1,
-            result_type="expand"
+            decide, axis=1, result_type="expand"
         )
 
+        # ---------- 5. UPSERT PREDICTIONS ----------
         processed = 0
 
-        # 4️⃣ UPSERT predictions
         for _, row in df.iterrows():
-
-            user_sys_id = get_user_sys_id(row["u_user"])
-            if not user_sys_id:
-                continue  # extremely rare now
+            user_sys_id = row["u_user"]              # already sys_id ✅
+            license_sys_id = row["u_license_sku"]    # already sys_id ✅
 
             payload = {
                 "u_user": user_sys_id,
-                "u_license_sku": row["u_license_sku"],
+                "u_license_sku": license_sys_id,
                 "u_predicted_action": row["u_predicted_action"],
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                "u_notification_stage": "NONE",
                 "u_predicted_on": datetime.utcnow().isoformat()
             }
 
+            # Check if prediction already exists
             check = requests.get(
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
                 params={
-                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={row['u_license_sku']}",
-                    "sysparm_limit": "1"
+                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={license_sys_id}",
+                    "sysparm_limit": 1
                 }
             )
 
@@ -178,13 +171,9 @@ def run_predictions():
 
             processed += 1
 
-        return {
-            "status": "success",
-            "records_processed": processed,
-            "batch_size": BATCH_SIZE,
-            "offset_used": OFFSET
-        }
+        print(f"✅ Prediction job completed successfully")
+        print(f"✅ Total records processed: {processed}")
 
-    except Exception as e:
+    except Exception:
+        print("❌ Error during prediction job")
         traceback.print_exc()
-        return {"status": "error", "details": str(e)}
