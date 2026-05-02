@@ -4,7 +4,7 @@ import requests
 import joblib
 import os
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -26,8 +26,17 @@ WRITE_PARAMS = {
     "sysparm_input_display_value": "false"
 }
 
+# ================= VALIDATE ENV =================
+if not all([SERVICENOW_INSTANCE, SN_USER, SN_PASS]):
+    raise ValueError("Missing required environment variables: SN_INSTANCE, SN_USER, SN_PASS")
+
 # ================= LOAD MODEL =================
-model = joblib.load("reclaim_model.pkl")
+try:
+    model = joblib.load("reclaim_model.pkl")
+    print("✅ Model loaded successfully")
+except Exception as e:
+    print(f"❌ Model load failed: {e}")
+    raise
 
 
 # ================= UTIL FUNCTIONS =================
@@ -51,6 +60,7 @@ def safe_request(method, url, **kwargs):
             print(f"❌ API Error [{resp.status_code}] -> {resp.text}")
 
         return resp
+
     except Exception as e:
         print(f"❌ Request failed: {e}")
         return None
@@ -62,7 +72,7 @@ def health():
     return {"status": "LCR ML service running"}
 
 
-# ================= START ENDPOINT =================
+# ================= TRIGGER ENDPOINT =================
 @app.post("/start_predictions")
 def start_predictions(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_predictions_job)
@@ -132,7 +142,7 @@ def run_predictions_job():
             if col not in df.columns:
                 df[col] = 0
 
-        # boolean conversion
+        # convert booleans
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
                 df[col]
@@ -180,7 +190,7 @@ def run_predictions_job():
 
         print(f"🔍 Unique user-license combinations: {unique_count}")
 
-        # ---------- UPSERT ----------
+        # ---------- UPSERT PREDICTIONS ----------
         processed = 0
         inserted = 0
         updated = 0
@@ -203,10 +213,10 @@ def run_predictions_job():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                "u_predicted_on": datetime.utcnow().isoformat()
+                "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
-            # check existing prediction
+            # ---------- CHECK EXISTING RECORD ----------
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
@@ -223,6 +233,7 @@ def run_predictions_job():
             if check_resp:
                 existing = check_resp.json().get("result", [])
 
+            # ---------- UPDATE ----------
             if existing:
                 sys_id = existing[0]["sys_id"]
 
@@ -238,6 +249,7 @@ def run_predictions_job():
                 if resp and resp.status_code in [200, 201]:
                     updated += 1
 
+            # ---------- INSERT ----------
             else:
                 resp = safe_request(
                     "POST",
