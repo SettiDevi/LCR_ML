@@ -26,9 +26,20 @@ WRITE_PARAMS = {
     "sysparm_input_display_value": "false"
 }
 
+# ================= VENDOR EMAIL MAP =================
+VENDOR_EMAIL_MAP = {
+    "Adobe_CC": "adobe.vendor@example.com",
+    "Zoom_Pro": "zoom.vendor@example.com",
+    "M365_E3": "microsoft.vendor@example.com",
+    "M365_E5": "microsoft.vendor@example.com",
+    "Salesforce_Enterprise": "salesforce.vendor@example.com"
+}
+
 # ================= VALIDATE ENV =================
 if not all([SERVICENOW_INSTANCE, SN_USER, SN_PASS]):
-    raise ValueError("Missing required environment variables: SN_INSTANCE, SN_USER, SN_PASS")
+    raise ValueError(
+        "Missing required environment variables: SN_INSTANCE, SN_USER, SN_PASS"
+    )
 
 # ================= LOAD MODEL =================
 try:
@@ -40,9 +51,10 @@ except Exception as e:
 
 
 # ================= UTIL FUNCTIONS =================
-def get_sys_id(val):
+def get_value(val):
     """
-    Handles ServiceNow reference fields safely.
+    Handles ServiceNow fields safely.
+    Supports dict reference values and plain strings.
     """
     if isinstance(val, dict):
         return val.get("value", "").strip()
@@ -51,7 +63,7 @@ def get_sys_id(val):
 
 def safe_request(method, url, **kwargs):
     """
-    Wrapper for requests with logging.
+    Safe requests wrapper with logging.
     """
     try:
         resp = requests.request(method, url, timeout=90, **kwargs)
@@ -87,7 +99,7 @@ def run_predictions_job():
     try:
         print("🔹 LCR Prediction job started")
 
-        # ---------- FETCH FEATURE STORE DATA ----------
+        # ---------- FETCH ALL FEATURE STORE RECORDS ----------
         all_rows = []
         offset = 0
         limit = 1000
@@ -137,12 +149,10 @@ def run_predictions_job():
             "u_user_active"
         ]
 
-        # fill missing columns
         for col in feature_cols:
             if col not in df.columns:
                 df[col] = 0
 
-        # convert booleans
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
                 df[col]
@@ -157,7 +167,7 @@ def run_predictions_job():
         # ---------- ML PREDICTION ----------
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
-        # ---------- DECISION LOGIC ----------
+        # ---------- BUSINESS DECISION ----------
         def decide(row):
             days = int(float(row.get("u_days_since_last_use", 0)))
             premium = int(float(row.get("u_premium_feature_usage_last_30_days", 0)))
@@ -180,17 +190,12 @@ def run_predictions_job():
             result_type="expand"
         )
 
-        # ---------- DEBUG UNIQUE COMBINATIONS ----------
-        unique_count = (
-            df[["u_user", "u_license_sku"]]
-            .astype(str)
-            .drop_duplicates()
-            .shape[0]
+        print(
+            f"🔍 Unique user-license combinations: "
+            f'{df[["u_user", "u_license_sku"]].astype(str).drop_duplicates().shape[0]}'
         )
 
-        print(f"🔍 Unique user-license combinations: {unique_count}")
-
-        # ---------- UPSERT PREDICTIONS ----------
+        # ---------- UPSERT ----------
         processed = 0
         inserted = 0
         updated = 0
@@ -198,32 +203,41 @@ def run_predictions_job():
 
         for _, row in df.iterrows():
 
-            user_sys_id = get_sys_id(row.get("u_user"))
-            license_sys_id = get_sys_id(row.get("u_license_sku"))
+            user_sys_id = get_value(row.get("u_user"))
+            license_name = get_value(row.get("u_license_sku"))
 
-            if not user_sys_id or not license_sys_id:
-                print(f"⚠ Skipping empty refs: user={user_sys_id}, license={license_sys_id}")
+            if not user_sys_id or not license_name:
                 skipped += 1
+                print(
+                    f"⚠ Skipping invalid row user={user_sys_id}, "
+                    f"license={license_name}"
+                )
                 continue
+
+            vendor_email = VENDOR_EMAIL_MAP.get(license_name, "")
 
             payload = {
                 "u_user": user_sys_id,
-                "u_license_sku": license_sys_id,
+                "u_license_sku": license_name,
+                "u_vendor_email": vendor_email,
                 "u_predicted_action": row["u_predicted_action"],
-                "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
+                "u_ai_reclaim_confidence": round(
+                    float(row["reclaim_probability"]), 2
+                ),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
                 "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
-            # ---------- CHECK EXISTING RECORD ----------
+            # ---------- CHECK EXISTING ----------
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
                 params={
-                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={license_sys_id}",
+                    "sysparm_query":
+                        f"u_user={user_sys_id}^u_license_sku={license_name}",
                     "sysparm_limit": 1,
                     "sysparm_display_value": "false"
                 }
@@ -239,7 +253,8 @@ def run_predictions_job():
 
                 resp = safe_request(
                     "PUT",
-                    f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
+                    f"{SERVICENOW_INSTANCE}/api/now/table/"
+                    f"{PREDICTIONS_TABLE}/{sys_id}",
                     auth=(SN_USER, SN_PASS),
                     headers=HEADERS,
                     params=WRITE_PARAMS,
