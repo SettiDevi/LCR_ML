@@ -37,54 +37,40 @@ VENDOR_EMAIL_MAP = {
 
 # ================= VALIDATE ENV =================
 if not all([SERVICENOW_INSTANCE, SN_USER, SN_PASS]):
-    raise ValueError(
-        "Missing required environment variables: SN_INSTANCE, SN_USER, SN_PASS"
-    )
+    raise ValueError("Missing required environment variables")
 
 # ================= LOAD MODEL =================
-try:
-    model = joblib.load("reclaim_model.pkl")
-    print("✅ Model loaded successfully")
-except Exception as e:
-    print(f"❌ Model load failed: {e}")
-    raise
+model = joblib.load("reclaim_model.pkl")
+print("✅ Model loaded successfully")
 
 
-# ================= UTIL FUNCTIONS =================
+# ================= UTIL =================
 def get_value(val):
-    """
-    Handles ServiceNow fields safely.
-    Supports dict reference values and plain strings.
-    """
     if isinstance(val, dict):
         return val.get("value", "").strip()
     return str(val).strip() if val else ""
 
 
 def safe_request(method, url, **kwargs):
-    """
-    Safe requests wrapper with logging.
-    """
     try:
         resp = requests.request(method, url, timeout=90, **kwargs)
 
         if resp.status_code not in [200, 201]:
-            print(f"❌ API Error [{resp.status_code}] -> {resp.text}")
+            print(f"❌ API Error [{resp.status_code}] {resp.text}")
 
         return resp
-
     except Exception as e:
         print(f"❌ Request failed: {e}")
         return None
 
 
-# ================= HEALTH CHECK =================
+# ================= HEALTH =================
 @app.get("/")
 def health():
     return {"status": "LCR ML service running"}
 
 
-# ================= TRIGGER ENDPOINT =================
+# ================= TRIGGER =================
 @app.post("/start_predictions")
 def start_predictions(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_predictions_job)
@@ -97,12 +83,17 @@ def start_predictions(background_tasks: BackgroundTasks):
 # ================= MAIN JOB =================
 def run_predictions_job():
     try:
-        print("🔹 LCR Prediction job started")
+        print("🔹 Prediction job started")
 
-        # ---------- FETCH ALL FEATURE STORE RECORDS ----------
         all_rows = []
         offset = 0
         limit = 1000
+
+        # ONLY FETCH UPDATED/NEW ROWS IN LAST 24 HOURS
+        query = (
+            "sys_updated_on>=javascript:gs.hoursAgoStart(24)"
+            "^u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
+        )
 
         while True:
             resp = safe_request(
@@ -113,7 +104,7 @@ def run_predictions_job():
                 params={
                     "sysparm_limit": limit,
                     "sysparm_offset": offset,
-                    "sysparm_query": "u_userISNOTEMPTY^u_license_skuISNOTEMPTY",
+                    "sysparm_query": query,
                     "sysparm_display_value": "false"
                 }
             )
@@ -132,12 +123,11 @@ def run_predictions_job():
             offset += limit
 
         if not all_rows:
-            print("⚠ No feature store data found")
+            print("⚠ No updated feature rows found")
             return
 
-        print(f"✅ Total rows fetched: {len(all_rows)}")
+        print(f"✅ Total updated rows fetched: {len(all_rows)}")
 
-        # ---------- DATAFRAME ----------
         df = pd.DataFrame(all_rows)
 
         feature_cols = [
@@ -164,10 +154,9 @@ def run_predictions_job():
 
         X = df[feature_cols].fillna(0).astype(float)
 
-        # ---------- ML PREDICTION ----------
+        # ================= PREDICT =================
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
-        # ---------- BUSINESS DECISION ----------
         def decide(row):
             days = int(float(row.get("u_days_since_last_use", 0)))
             premium = int(float(row.get("u_premium_feature_usage_last_30_days", 0)))
@@ -190,17 +179,12 @@ def run_predictions_job():
             result_type="expand"
         )
 
-        print(
-            f"🔍 Unique user-license combinations: "
-            f'{df[["u_user", "u_license_sku"]].astype(str).drop_duplicates().shape[0]}'
-        )
-
-        # ---------- UPSERT ----------
         processed = 0
         inserted = 0
         updated = 0
         skipped = 0
 
+        # ================= UPSERT =================
         for _, row in df.iterrows():
 
             user_sys_id = get_value(row.get("u_user"))
@@ -208,10 +192,6 @@ def run_predictions_job():
 
             if not user_sys_id or not license_name:
                 skipped += 1
-                print(
-                    f"⚠ Skipping invalid row user={user_sys_id}, "
-                    f"license={license_name}"
-                )
                 continue
 
             vendor_email = VENDOR_EMAIL_MAP.get(license_name, "")
@@ -229,7 +209,6 @@ def run_predictions_job():
                 "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
-            # ---------- CHECK EXISTING ----------
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
@@ -247,14 +226,12 @@ def run_predictions_job():
             if check_resp:
                 existing = check_resp.json().get("result", [])
 
-            # ---------- UPDATE ----------
             if existing:
                 sys_id = existing[0]["sys_id"]
 
                 resp = safe_request(
                     "PUT",
-                    f"{SERVICENOW_INSTANCE}/api/now/table/"
-                    f"{PREDICTIONS_TABLE}/{sys_id}",
+                    f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}/{sys_id}",
                     auth=(SN_USER, SN_PASS),
                     headers=HEADERS,
                     params=WRITE_PARAMS,
@@ -264,7 +241,6 @@ def run_predictions_job():
                 if resp and resp.status_code in [200, 201]:
                     updated += 1
 
-            # ---------- INSERT ----------
             else:
                 resp = safe_request(
                     "POST",
@@ -281,16 +257,15 @@ def run_predictions_job():
             processed += 1
 
             if processed % 100 == 0:
-                print(f"🚀 Processed {processed} records...")
+                print(f"🚀 Processed {processed} rows")
 
-        # ---------- SUMMARY ----------
         print("\n========== JOB SUMMARY ==========")
         print(f"Processed : {processed}")
         print(f"Inserted  : {inserted}")
         print(f"Updated   : {updated}")
         print(f"Skipped   : {skipped}")
-        print("✅ Prediction job completed successfully")
+        print("✅ Prediction job completed")
 
     except Exception:
-        print("❌ Error during prediction job")
+        print("❌ Prediction job failed")
         traceback.print_exc()
