@@ -4,7 +4,7 @@ import requests
 import joblib
 import os
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 
 app = FastAPI()
 
@@ -46,18 +46,27 @@ print("✅ Model loaded successfully")
 
 # ================= UTIL FUNCTIONS =================
 def get_sys_id(val):
+    """
+    Extract sys_id from ServiceNow reference field.
+    """
     if isinstance(val, dict):
         return val.get("value", "").strip()
     return str(val).strip() if val else ""
 
 
 def get_display_value(val):
+    """
+    Extract display value from ServiceNow reference field.
+    """
     if isinstance(val, dict):
         return val.get("display_value", "").strip()
     return str(val).strip() if val else ""
 
 
 def safe_request(method, url, **kwargs):
+    """
+    Safe requests wrapper with timeout and logging.
+    """
     try:
         resp = requests.request(method, url, timeout=90, **kwargs)
 
@@ -71,13 +80,13 @@ def safe_request(method, url, **kwargs):
         return None
 
 
-# ================= HEALTH =================
+# ================= HEALTH CHECK =================
 @app.get("/")
 def health():
     return {"status": "LCR ML service running"}
 
 
-# ================= TRIGGER =================
+# ================= TRIGGER ENDPOINT =================
 @app.post("/start_predictions")
 def start_predictions(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_predictions_job)
@@ -98,7 +107,7 @@ def run_predictions_job():
 
         query = "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
 
-        # ---------- FETCH FEATURE STORE ----------
+        # ---------- FETCH FEATURE STORE DATA ----------
         while True:
             resp = safe_request(
                 "GET",
@@ -148,6 +157,7 @@ def run_predictions_job():
             if col not in df.columns:
                 df[col] = 0
 
+        # Convert booleans
         for col in ["u_seasonal_user", "u_user_active"]:
             df[col] = (
                 df[col]
@@ -184,7 +194,7 @@ def run_predictions_job():
             result_type="expand"
         )
 
-        # ---------- UPSERT ----------
+        # ---------- UPSERT INTO PREDICTIONS ----------
         processed = 0
         inserted = 0
         updated = 0
@@ -198,7 +208,7 @@ def run_predictions_job():
 
             if not user_sys_id or not license_sys_id:
                 skipped += 1
-                print(f"⚠ Skipped invalid row")
+                print("⚠ Skipped invalid row")
                 continue
 
             vendor_email = VENDOR_EMAIL_MAP.get(license_display, "")
@@ -211,10 +221,10 @@ def run_predictions_job():
                 "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
-                "u_predicted_on": datetime.now(timezone.utc).isoformat()
+                "u_predicted_on": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             }
 
-            # ---------- CHECK EXISTING ----------
+            # ---------- CHECK EXISTING RECORD ----------
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
@@ -231,7 +241,7 @@ def run_predictions_job():
             if check_resp:
                 existing = check_resp.json().get("result", [])
 
-            # UPDATE
+            # ---------- UPDATE ----------
             if existing:
                 sys_id = existing[0]["sys_id"]
 
@@ -248,7 +258,7 @@ def run_predictions_job():
                     updated += 1
                     print(f"✅ Updated: {user_sys_id} | {license_display}")
 
-            # INSERT
+            # ---------- INSERT ----------
             else:
                 resp = safe_request(
                     "POST",
@@ -268,6 +278,7 @@ def run_predictions_job():
             if processed % 100 == 0:
                 print(f"🚀 Processed {processed} rows")
 
+        # ---------- SUMMARY ----------
         print("\n========== JOB SUMMARY ==========")
         print(f"Processed : {processed}")
         print(f"Inserted  : {inserted}")
