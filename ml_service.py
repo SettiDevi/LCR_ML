@@ -45,9 +45,15 @@ print("✅ Model loaded successfully")
 
 
 # ================= UTIL FUNCTIONS =================
-def get_value(val):
+def get_sys_id(val):
     if isinstance(val, dict):
         return val.get("value", "").strip()
+    return str(val).strip() if val else ""
+
+
+def get_display_value(val):
+    if isinstance(val, dict):
+        return val.get("display_value", "").strip()
     return str(val).strip() if val else ""
 
 
@@ -65,13 +71,13 @@ def safe_request(method, url, **kwargs):
         return None
 
 
-# ================= HEALTH CHECK =================
+# ================= HEALTH =================
 @app.get("/")
 def health():
     return {"status": "LCR ML service running"}
 
 
-# ================= TRIGGER ENDPOINT =================
+# ================= TRIGGER =================
 @app.post("/start_predictions")
 def start_predictions(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_predictions_job)
@@ -103,7 +109,7 @@ def run_predictions_job():
                     "sysparm_limit": limit,
                     "sysparm_offset": offset,
                     "sysparm_query": query,
-                    "sysparm_display_value": "false"
+                    "sysparm_display_value": "all"
                 }
             )
 
@@ -128,7 +134,6 @@ def run_predictions_job():
 
         # ---------- DATAFRAME ----------
         df = pd.DataFrame(all_rows)
-        print(f"✅ Rows ready for prediction: {len(df)}")
 
         feature_cols = [
             "u_days_since_last_use",
@@ -187,36 +192,36 @@ def run_predictions_job():
 
         for _, row in df.iterrows():
 
-            user_sys_id = get_value(row.get("u_user"))
-            license_name = get_value(row.get("u_license_sku"))
+            user_sys_id = get_sys_id(row.get("u_user"))
+            license_sys_id = get_sys_id(row.get("u_license_sku"))
+            license_display = get_display_value(row.get("u_license_sku"))
 
-            if not user_sys_id or not license_name:
+            if not user_sys_id or not license_sys_id:
                 skipped += 1
-                print(f"⚠ Skipped invalid row: user={user_sys_id}, license={license_name}")
+                print(f"⚠ Skipped invalid row")
                 continue
 
-            vendor_email = VENDOR_EMAIL_MAP.get(license_name, "")
+            vendor_email = VENDOR_EMAIL_MAP.get(license_display, "")
 
             payload = {
                 "u_user": user_sys_id,
-                "u_license_sku": license_name,
+                "u_license_sku": license_sys_id,
                 "u_vendor_email": vendor_email,
                 "u_predicted_action": row["u_predicted_action"],
-                "u_ai_reclaim_confidence": round(
-                    float(row["reclaim_probability"]), 2
-                ),
+                "u_ai_reclaim_confidence": round(float(row["reclaim_probability"]), 2),
                 "u_ai_reclaim_reason": row["u_ai_reclaim_reason"],
                 "u_model_name": MODEL_NAME,
                 "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
+            # ---------- CHECK EXISTING ----------
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
                 params={
-                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={license_name}",
+                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={license_sys_id}",
                     "sysparm_limit": 1,
                     "sysparm_display_value": "false"
                 }
@@ -241,7 +246,7 @@ def run_predictions_job():
 
                 if resp and resp.status_code in [200, 201]:
                     updated += 1
-                    print(f"✅ Updated: {user_sys_id} | {license_name}")
+                    print(f"✅ Updated: {user_sys_id} | {license_display}")
 
             # INSERT
             else:
@@ -256,14 +261,13 @@ def run_predictions_job():
 
                 if resp and resp.status_code in [200, 201]:
                     inserted += 1
-                    print(f"✅ Inserted: {user_sys_id} | {license_name}")
+                    print(f"✅ Inserted: {user_sys_id} | {license_display}")
 
             processed += 1
 
             if processed % 100 == 0:
                 print(f"🚀 Processed {processed} rows")
 
-        # ---------- SUMMARY ----------
         print("\n========== JOB SUMMARY ==========")
         print(f"Processed : {processed}")
         print(f"Inserted  : {inserted}")
