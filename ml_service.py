@@ -46,19 +46,12 @@ print("✅ Model loaded successfully")
 
 # ================= UTIL FUNCTIONS =================
 def get_value(val):
-    """
-    Safely extract value from ServiceNow response.
-    Handles dict references and plain strings.
-    """
     if isinstance(val, dict):
         return val.get("value", "").strip()
     return str(val).strip() if val else ""
 
 
 def safe_request(method, url, **kwargs):
-    """
-    Wrapper for API requests with logging.
-    """
     try:
         resp = requests.request(method, url, timeout=90, **kwargs)
 
@@ -97,9 +90,9 @@ def run_predictions_job():
         offset = 0
         limit = 1000
 
-        # Fetch all valid rows
         query = "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
 
+        # ---------- FETCH FEATURE STORE ----------
         while True:
             resp = safe_request(
                 "GET",
@@ -133,24 +126,9 @@ def run_predictions_job():
 
         print(f"✅ Total rows fetched: {len(all_rows)}")
 
-        # ================= DATAFRAME =================
+        # ---------- DATAFRAME ----------
         df = pd.DataFrame(all_rows)
-
-        # Filter only rows updated in last 24 hours
-        df["sys_updated_on"] = pd.to_datetime(
-            df["sys_updated_on"],
-            errors="coerce",
-            utc=True
-        )
-
-        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
-        df = df[df["sys_updated_on"] >= cutoff]
-
-        if df.empty:
-            print("⚠ No recently updated rows after filtering")
-            return
-
-        print(f"✅ Rows after 24h filter: {len(df)}")
+        print(f"✅ Rows ready for prediction: {len(df)}")
 
         feature_cols = [
             "u_days_since_last_use",
@@ -176,7 +154,7 @@ def run_predictions_job():
 
         X = df[feature_cols].fillna(0).astype(float)
 
-        # ================= ML PREDICTION =================
+        # ---------- ML PREDICTION ----------
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
         def decide(row):
@@ -201,7 +179,7 @@ def run_predictions_job():
             result_type="expand"
         )
 
-        # ================= UPSERT =================
+        # ---------- UPSERT ----------
         processed = 0
         inserted = 0
         updated = 0
@@ -232,15 +210,13 @@ def run_predictions_job():
                 "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
-            # Check if record exists
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
                 auth=(SN_USER, SN_PASS),
                 headers=HEADERS,
                 params={
-                    "sysparm_query":
-                        f"u_user={user_sys_id}^u_license_sku={license_name}",
+                    "sysparm_query": f"u_user={user_sys_id}^u_license_sku={license_name}",
                     "sysparm_limit": 1,
                     "sysparm_display_value": "false"
                 }
@@ -250,7 +226,7 @@ def run_predictions_job():
             if check_resp:
                 existing = check_resp.json().get("result", [])
 
-            # UPDATE existing
+            # UPDATE
             if existing:
                 sys_id = existing[0]["sys_id"]
 
@@ -265,8 +241,9 @@ def run_predictions_job():
 
                 if resp and resp.status_code in [200, 201]:
                     updated += 1
+                    print(f"✅ Updated: {user_sys_id} | {license_name}")
 
-            # INSERT new
+            # INSERT
             else:
                 resp = safe_request(
                     "POST",
@@ -279,13 +256,14 @@ def run_predictions_job():
 
                 if resp and resp.status_code in [200, 201]:
                     inserted += 1
+                    print(f"✅ Inserted: {user_sys_id} | {license_name}")
 
             processed += 1
 
             if processed % 100 == 0:
                 print(f"🚀 Processed {processed} rows")
 
-        # ================= SUMMARY =================
+        # ---------- SUMMARY ----------
         print("\n========== JOB SUMMARY ==========")
         print(f"Processed : {processed}")
         print(f"Inserted  : {inserted}")
