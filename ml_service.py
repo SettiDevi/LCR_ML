@@ -44,33 +44,41 @@ model = joblib.load("reclaim_model.pkl")
 print("✅ Model loaded successfully")
 
 
-# ================= UTIL =================
+# ================= UTIL FUNCTIONS =================
 def get_value(val):
+    """
+    Safely extract value from ServiceNow response.
+    Handles dict references and plain strings.
+    """
     if isinstance(val, dict):
         return val.get("value", "").strip()
     return str(val).strip() if val else ""
 
 
 def safe_request(method, url, **kwargs):
+    """
+    Wrapper for API requests with logging.
+    """
     try:
         resp = requests.request(method, url, timeout=90, **kwargs)
 
         if resp.status_code not in [200, 201]:
-            print(f"❌ API Error [{resp.status_code}] {resp.text}")
+            print(f"❌ API Error [{resp.status_code}] -> {resp.text}")
 
         return resp
+
     except Exception as e:
         print(f"❌ Request failed: {e}")
         return None
 
 
-# ================= HEALTH =================
+# ================= HEALTH CHECK =================
 @app.get("/")
 def health():
     return {"status": "LCR ML service running"}
 
 
-# ================= TRIGGER =================
+# ================= TRIGGER ENDPOINT =================
 @app.post("/start_predictions")
 def start_predictions(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_predictions_job)
@@ -89,11 +97,8 @@ def run_predictions_job():
         offset = 0
         limit = 1000
 
-        # ONLY FETCH UPDATED/NEW ROWS IN LAST 24 HOURS
-        query = (
-            "sys_updated_on>=javascript:gs.hoursAgoStart(24)"
-            "^u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
-        )
+        # Fetch all valid rows
+        query = "u_userISNOTEMPTY^u_license_skuISNOTEMPTY"
 
         while True:
             resp = safe_request(
@@ -123,12 +128,29 @@ def run_predictions_job():
             offset += limit
 
         if not all_rows:
-            print("⚠ No updated feature rows found")
+            print("⚠ No feature store rows found")
             return
 
-        print(f"✅ Total updated rows fetched: {len(all_rows)}")
+        print(f"✅ Total rows fetched: {len(all_rows)}")
 
+        # ================= DATAFRAME =================
         df = pd.DataFrame(all_rows)
+
+        # Filter only rows updated in last 24 hours
+        df["sys_updated_on"] = pd.to_datetime(
+            df["sys_updated_on"],
+            errors="coerce",
+            utc=True
+        )
+
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
+        df = df[df["sys_updated_on"] >= cutoff]
+
+        if df.empty:
+            print("⚠ No recently updated rows after filtering")
+            return
+
+        print(f"✅ Rows after 24h filter: {len(df)}")
 
         feature_cols = [
             "u_days_since_last_use",
@@ -154,7 +176,7 @@ def run_predictions_job():
 
         X = df[feature_cols].fillna(0).astype(float)
 
-        # ================= PREDICT =================
+        # ================= ML PREDICTION =================
         df["reclaim_probability"] = model.predict_proba(X)[:, 1]
 
         def decide(row):
@@ -179,12 +201,12 @@ def run_predictions_job():
             result_type="expand"
         )
 
+        # ================= UPSERT =================
         processed = 0
         inserted = 0
         updated = 0
         skipped = 0
 
-        # ================= UPSERT =================
         for _, row in df.iterrows():
 
             user_sys_id = get_value(row.get("u_user"))
@@ -192,6 +214,7 @@ def run_predictions_job():
 
             if not user_sys_id or not license_name:
                 skipped += 1
+                print(f"⚠ Skipped invalid row: user={user_sys_id}, license={license_name}")
                 continue
 
             vendor_email = VENDOR_EMAIL_MAP.get(license_name, "")
@@ -209,6 +232,7 @@ def run_predictions_job():
                 "u_predicted_on": datetime.now(timezone.utc).isoformat()
             }
 
+            # Check if record exists
             check_resp = safe_request(
                 "GET",
                 f"{SERVICENOW_INSTANCE}/api/now/table/{PREDICTIONS_TABLE}",
@@ -226,6 +250,7 @@ def run_predictions_job():
             if check_resp:
                 existing = check_resp.json().get("result", [])
 
+            # UPDATE existing
             if existing:
                 sys_id = existing[0]["sys_id"]
 
@@ -241,6 +266,7 @@ def run_predictions_job():
                 if resp and resp.status_code in [200, 201]:
                     updated += 1
 
+            # INSERT new
             else:
                 resp = safe_request(
                     "POST",
@@ -259,12 +285,13 @@ def run_predictions_job():
             if processed % 100 == 0:
                 print(f"🚀 Processed {processed} rows")
 
+        # ================= SUMMARY =================
         print("\n========== JOB SUMMARY ==========")
         print(f"Processed : {processed}")
         print(f"Inserted  : {inserted}")
         print(f"Updated   : {updated}")
         print(f"Skipped   : {skipped}")
-        print("✅ Prediction job completed")
+        print("✅ Prediction job completed successfully")
 
     except Exception:
         print("❌ Prediction job failed")
